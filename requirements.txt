@@ -1,0 +1,5 @@
+# 串口通信稳定性测试工具依赖
+# 安装命令: pip install -r requirements.txt
+
+pyserial>=3.5
+matplotlib>=3.5.0
