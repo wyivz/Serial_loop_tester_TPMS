@@ -321,7 +321,7 @@ def reader_thread(ser: serial.Serial):
                 # 记录时间戳（用于CSV）
                 recv_time = time.time()
 
-                print(f'\n  ← 收到 [{len(data)} 字节] HEX: {hex_str}  |  ASCII: {text.strip()!r}')
+                print(f'\n  ← 收到 [{len(data)} 字节] ASCII: {text.strip()!r}  |  HEX: {hex_str}')
 
                 # ── 记录到 CSV（如果有循环在运行） ──
                 if loop_running and csv_writer:
