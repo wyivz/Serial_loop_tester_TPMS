@@ -34,6 +34,8 @@ import time
 import sys
 import re
 import datetime
+import csv
+import os
 import matplotlib.pyplot as plt
 import matplotlib
 # 使用支持中文的字体，避免图表中文乱码
@@ -95,6 +97,14 @@ rx_event = threading.Event()    # 收到数据时 set
 rx_data_buf = []                # 收到的最新数据文本（list 保一个元素，线程安全用锁）
 rx_buf_lock = threading.Lock()
 
+# CSV 记录相关
+csv_file = None
+csv_writer = None
+csv_record_count = 0
+csv_lock = threading.Lock()
+csv_start_time = 0.0
+last_send_time = 0.0  # 上次发送的时间戳，用于计算响应时间
+
 
 def parse_command(text: str) -> bytes:
     """
@@ -107,6 +117,48 @@ def parse_command(text: str) -> bytes:
         return bytes(int(t, 16) for t in tokens)
     except ValueError:
         return text.encode('utf-8')
+
+
+# ──────────────────────────────────────────────
+# CSV 记录功能
+# ──────────────────────────────────────────────
+def open_csv():
+    """创建 CSV 文件并写入表头，返回文件对象和写入器。"""
+    global csv_file, csv_writer, csv_start_time
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'Record_{timestamp}.csv'
+    csv_file = open(filename, 'w', newline='', encoding='utf-8-sig')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['序号', '时间', 'ASCII内容', '信号强度', '响应时间(ms)'])
+    csv_start_time = time.time()
+    print(f'[INFO] 已创建记录文件：{filename}')
+    return csv_file, csv_writer
+
+
+def close_csv():
+    """关闭 CSV 文件。"""
+    global csv_file
+    if csv_file and not csv_file.closed:
+        csv_file.close()
+        print(f'[INFO] CSV 文件已关闭，共记录 {csv_record_count} 条')
+
+
+def write_csv_record(seq: int, ascii_content: str, signal: int, rtt_ms: float):
+    """
+    写入一条记录到 CSV 文件。
+    参数:
+        seq: 序号
+        ascii_content: ASCII 内容
+        signal: 信号强度
+        rtt_ms: 响应时间（毫秒）
+    """
+    global csv_record_count
+    elapsed = (time.time() - csv_start_time) * 1000  # 相对时间（毫秒）
+    timestamp = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    with csv_lock:
+        if csv_writer:
+            csv_writer.writerow([seq, timestamp, ascii_content, signal, round(rtt_ms, 2)])
+            csv_record_count += 1
 
 
 def print_stats():
@@ -124,6 +176,7 @@ def print_stats():
     print(f'  总循环次数   : {count}')
     print(f'  OK 次数      : {ok}  ({ok/count*100:.1f}%)' if count else '  OK 次数      : 0')
     print(f'  总运行时间   : {elapsed:.2f} 秒')
+    print(f'  CSV 记录数   : {csv_record_count}')
 
     if rtt:
         print(f'  响应时间(RTT)')
@@ -265,7 +318,24 @@ def reader_thread(ser: serial.Serial):
                 except Exception:
                     text = repr(data)
 
+                # 记录时间戳（用于CSV）
+                recv_time = time.time()
+
                 print(f'\n  ← 收到 [{len(data)} 字节] HEX: {hex_str}  |  ASCII: {text.strip()!r}')
+
+                # ── 记录到 CSV（如果有循环在运行） ──
+                if loop_running and csv_writer:
+                    is_ok, signal = parse_response(text)
+                    if signal is not None:
+                        # 计算响应时间
+                        with stats_lock:
+                            rtt = recv_time - last_send_time if 'last_send_time' in globals() else 0
+                        rtt_ms = rtt * 1000 if rtt else 0
+                        # 写入 CSV（序号使用 stat_send_count）
+                        with stats_lock:
+                            seq = stat_send_count
+                        ascii_content = text.strip().replace('\r', '').replace('\n', ' ')
+                        write_csv_record(seq, ascii_content, signal, rtt_ms)
 
                 # 解析 OK 和信号强度（只在循环运行期间统计）
                 if loop_running:
@@ -299,9 +369,10 @@ def reader_thread(ser: serial.Serial):
 # ──────────────────────────────────────────────
 def loop_time_thread(ser: serial.Serial):
     """按固定时间间隔循环发送，直到 loop_running=False 或达到目标次数。"""
-    global loop_running, stat_send_count
+    global loop_running, stat_send_count, last_send_time
     while loop_running and not stop_event.is_set():
         send_time = time.time()
+        last_send_time = send_time  # 记录发送时间用于计算 RTT
         try:
             ser.write(loop_cmd)
             with stats_lock:
@@ -348,10 +419,11 @@ def loop_rx_thread(ser: serial.Serial):
     收到串口返回值后立即发送下一次命令。
     第一次发送由本线程启动时主动触发。
     """
-    global loop_running, stat_send_count
+    global loop_running, stat_send_count, last_send_time
 
     while loop_running and not stop_event.is_set():
         send_time = time.time()
+        last_send_time = send_time  # 记录发送时间用于计算 RTT
         try:
             ser.write(loop_cmd)
             with stats_lock:
@@ -392,7 +464,7 @@ def main():
 
     # ── 启动时询问串口配置 ──
     print('=' * 60)
-    print('  串口交互监听工具 v2')
+    print('  串口交互监听工具 ')
     print('=' * 60)
 
     # 询问串口号
@@ -435,7 +507,7 @@ def main():
     loop_thread = None
 
     def stop_loop():
-        """停止当前循环并打印统计。"""
+        """停止当前循环并打印统计、关闭CSV。"""
         nonlocal loop_thread
         if loop_running:
             loop_running_was = True
@@ -451,6 +523,8 @@ def main():
 
         if loop_running_was:
             print_stats()
+            # 关闭 CSV 文件
+            close_csv()
 
     try:
         while True:
@@ -541,6 +615,8 @@ def main():
 
                     # 重置统计并启动线程
                     reset_stats()
+                    # 打开 CSV 记录文件
+                    open_csv()
                     loop_running = True
                     rx_event.clear()
 
@@ -574,11 +650,15 @@ def main():
             if loop_thread and loop_thread.is_alive():
                 loop_thread.join(timeout=3)
             print_stats()
+            close_csv()
     finally:
         loop_running = False
         stop_event.set()
         if loop_thread and loop_thread.is_alive():
             loop_thread.join(timeout=2)
+        # 关闭 CSV（如果还在打开状态）
+        if csv_file and not csv_file.closed:
+            close_csv()
         ser.close()
         print('[INFO] 串口已关闭，程序结束')
 
